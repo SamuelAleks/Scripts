@@ -22,7 +22,7 @@ SHARES=("{SHARE1}" "{SHARE2}" "{SHARE3}")
 # SCRIPT METADATA
 # =============================================================================
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_NAME="setup-nas-mounts"
 
 # =============================================================================
@@ -77,7 +77,8 @@ DESCRIPTION
 
     The script performs the following:
       • Validates NAS connectivity and configuration
-      • Installs required packages (autofs, cifs-utils, smbclient, libnotify)
+      • Checks that autofs is installed (must be installed from AUR first)
+      • Installs remaining packages (cifs-utils, smbclient, libnotify)
       • Creates SMB credentials file with secure permissions
       • Configures autofs for on-demand mounting
       • Installs monitoring scripts and systemd user services
@@ -219,7 +220,7 @@ SEE ALSO
     autofs(8), mount.cifs(8), smbclient(1), systemctl(1)
 
 VERSION
-    1.1.1
+    1.2.0
 
 MAN_EOF
 }
@@ -238,10 +239,12 @@ get_user_info() {
         REAL_USER="$SUDO_USER"
         REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
         MOUNT_UID=$(id -u "$SUDO_USER")
+        MOUNT_GID=$(id -g "$SUDO_USER")
     else
         REAL_USER="${USER:-root}"
         REAL_HOME="${HOME:-/root}"
         MOUNT_UID=$(id -u)
+        MOUNT_GID=$(id -g)
     fi
 }
 
@@ -316,18 +319,29 @@ uninstall_full() {
     echo "Removing credentials file..."
     rm -f "$CREDS_FILE"
 
-    # Remove entry from auto.master
-    echo "Cleaning auto.master..."
-    if [[ -f /etc/auto.master ]]; then
-        grep -v "^/mnt/nas[[:space:]]" /etc/auto.master > /etc/auto.master.tmp.$$ 2>/dev/null || true
-        mv /etc/auto.master.tmp.$$ /etc/auto.master
-    fi
+    # Remove entry from auto.master (check both possible locations)
+    echo "Cleaning auto.master entries..."
+    for master_file in /etc/auto.master /etc/autofs/auto.master; do
+        if [[ -f "$master_file" ]]; then
+            if grep -q "^/mnt/nas[[:space:]]" "$master_file" 2>/dev/null; then
+                echo "  Removing /mnt/nas entry from $master_file..."
+                local temp_file="${master_file}.tmp.$$"
+                if grep -v "^/mnt/nas[[:space:]]" "$master_file" > "$temp_file" 2>/dev/null; then
+                    mv "$temp_file" "$master_file"
+                else
+                    rm -f "$temp_file"
+                fi
+            fi
+        fi
+    done
 
-    # Remove auto.master backups
+    # Remove auto.master backups from both locations
     echo "Removing auto.master backups..."
     rm -f /etc/auto.master.bak.*
+    rm -f /etc/autofs/auto.master.bak.*
     rm -f /etc/auto.master.lock
     rm -f /etc/auto.master.tmp.* 2>/dev/null || true
+    rm -f /etc/autofs/auto.master.tmp.* 2>/dev/null || true
 
     # Remove symlink
     echo "Removing symlink..."
@@ -355,9 +369,11 @@ uninstall_full() {
     echo "All NAS mount components have been removed."
     echo ""
     echo "Note: The following packages were NOT removed (may be used by other programs):"
-    echo "  autofs, cifs-utils, smbclient, libnotify"
+    echo "  autofs (AUR), cifs-utils, smbclient, libnotify"
     echo ""
-    echo "To remove them: sudo pacman -Rs autofs cifs-utils smbclient libnotify"
+    echo "To remove them:"
+    echo "  yay -Rs autofs                                  # AUR package"
+    echo "  sudo pacman -Rs cifs-utils smbclient libnotify  # Official packages"
 }
 
 # =============================================================================
@@ -438,6 +454,7 @@ remove_alias_block_from_file() {
     local rc_file="$1"
     local temp_file
     temp_file=$(mktemp)
+    TEMP_FILES_TO_CLEAN+=("$temp_file")
 
     # Use awk to remove everything between markers (inclusive)
     awk -v start="$ALIAS_MARKER_START" -v end="$ALIAS_MARKER_END" '
@@ -446,11 +463,21 @@ remove_alias_block_from_file() {
         !skip { print }
     ' "$rc_file" > "$temp_file"
 
-    # Remove trailing blank lines that might accumulate
-    # (keeps one trailing newline)
-    # Note: This sed syntax is GNU sed-specific (target: EndeavourOS/Arch).
-    # BSD sed (macOS) would require different syntax.
-    sed -i -e :a -e '/^\s*$/{ $d; N; ba' -e '}' "$temp_file" 2>/dev/null || true
+    # Remove trailing blank lines by reversing, removing leading blanks, reversing back.
+    # tac reverses lines; awk 'NF {p=1} p' removes leading blank lines from the reversed
+    # content (which are trailing blanks in the original); tac reverses back.
+    local temp_file2="${temp_file}.2"
+    TEMP_FILES_TO_CLEAN+=("$temp_file2")
+    if command -v tac &>/dev/null; then
+        tac "$temp_file" | awk 'NF {p=1} p' | tac > "$temp_file2" && mv "$temp_file2" "$temp_file"
+    else
+        # Fallback for systems without tac (e.g., macOS without coreutils)
+        # Use tail -r if available, otherwise skip trailing blank removal
+        if tail -r "$temp_file" &>/dev/null; then
+            tail -r "$temp_file" | awk 'NF {p=1} p' | tail -r > "$temp_file2" && mv "$temp_file2" "$temp_file"
+        fi
+        # If neither available, just skip trailing blank removal (cosmetic only)
+    fi
 
     mv "$temp_file" "$rc_file"
 }
@@ -470,6 +497,252 @@ remove_shell_aliases() {
             fi
         fi
     done
+}
+
+# =============================================================================
+# AUTOFS CONFIGURATION DETECTION
+# =============================================================================
+
+# Detect which auto.master file autofs actually uses as primary
+# Returns the path to the primary auto.master file
+detect_primary_auto_master() {
+    local primary=""
+    
+    # Method 1: Check systemd unit for hints about config location
+    # This is safe as it only reads unit file content, doesn't invoke automount
+    if [[ -z "$primary" ]] && command -v systemctl &>/dev/null; then
+        local unit_content
+        unit_content=$(systemctl cat autofs 2>/dev/null || true)
+        if echo "$unit_content" | grep -q "/etc/autofs/auto.master"; then
+            primary="/etc/autofs/auto.master"
+        fi
+    fi
+    
+    # Method 2: Check autofs package configuration files
+    if [[ -z "$primary" ]]; then
+        # Check autofs default configuration
+        if [[ -f /etc/default/autofs ]]; then
+            local master_from_default
+            master_from_default=$(grep -E '^MASTER_MAP_NAME=' /etc/default/autofs 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+            if [[ "$master_from_default" == "/etc/autofs/auto.master" ]]; then
+                primary="/etc/autofs/auto.master"
+            fi
+        fi
+        # Check autofs.conf if it exists
+        if [[ -z "$primary" && -f /etc/autofs.conf ]]; then
+            local master_from_conf
+            master_from_conf=$(grep -E '^master_map_name\s*=' /etc/autofs.conf 2>/dev/null | sed 's/.*=\s*//' | tr -d '"' || true)
+            if [[ "$master_from_conf" == "/etc/autofs/auto.master" ]]; then
+                primary="/etc/autofs/auto.master"
+            fi
+        fi
+    fi
+    
+    # Method 3: Check file existence and content
+    if [[ -z "$primary" ]]; then
+        if [[ -f /etc/autofs/auto.master ]]; then
+            # Check if it has actual mount entries (not just +auto.master include)
+            local has_entries
+            has_entries=$(grep -v '^#' /etc/autofs/auto.master 2>/dev/null | grep -v '^\s*$' | grep -v '^+' | head -1 || true)
+            if [[ -n "$has_entries" ]]; then
+                primary="/etc/autofs/auto.master"
+            fi
+        fi
+    fi
+    
+    # Default: traditional location
+    if [[ -z "$primary" ]]; then
+        primary="/etc/auto.master"
+    fi
+    
+    echo "$primary"
+}
+
+# Check for conflicting NAS mount configurations
+# Returns 0 if conflicts found, 1 if no conflicts
+# Outputs conflict information to stdout
+check_for_conflicts() {
+    local found_conflicts=1  # 1 = no conflicts (shell convention: 0 = true/found)
+    local conflicts=()
+    
+    # Check both possible auto.master locations for /mnt/nas entries
+    local master_files=("/etc/auto.master" "/etc/autofs/auto.master")
+    
+    for master_file in "${master_files[@]}"; do
+        if [[ -f "$master_file" ]]; then
+            local entry
+            entry=$(grep "^/mnt/nas[[:space:]]" "$master_file" 2>/dev/null || true)
+            if [[ -n "$entry" ]]; then
+                # Extract the map file path from the entry
+                local map_file
+                map_file=$(echo "$entry" | awk '{print $2}')
+                conflicts+=("ENTRY|$master_file|$entry|$map_file")
+                found_conflicts=0
+            fi
+        fi
+    done
+    
+    # Check for existing map files that might conflict
+    local existing_maps=()
+    while IFS= read -r -d '' map; do
+        existing_maps+=("$map")
+    done < <(find /etc/autofs -maxdepth 1 -name 'auto.nas*' -print0 2>/dev/null || true)
+    while IFS= read -r -d '' map; do
+        existing_maps+=("$map")
+    done < <(find /etc/autofs -maxdepth 1 -name 'nas*.autofs' -print0 2>/dev/null || true)
+    
+    for map in "${existing_maps[@]}"; do
+        if [[ -f "$map" && "$map" != "$AUTOFS_MAP" ]]; then
+            conflicts+=("MAP|$map")
+            found_conflicts=0
+        fi
+    done
+    
+    # Output conflicts for parsing
+    for conflict in "${conflicts[@]}"; do
+        echo "$conflict"
+    done
+    
+    return $found_conflicts
+}
+
+# Handle detected conflicts interactively
+# Input: array of conflict strings from check_for_conflicts
+handle_conflicts() {
+    local -a conflicts=("$@")
+    
+    if [[ ${#conflicts[@]} -eq 0 ]]; then
+        return 0
+    fi
+    
+    echo ""
+    echo "WARNING: Existing NAS mount configuration detected:"
+    echo ""
+    
+    for conflict in "${conflicts[@]}"; do
+        IFS='|' read -r type location entry map_file <<< "$conflict"
+        
+        if [[ "$type" == "ENTRY" ]]; then
+            echo "  • Entry in $location:"
+            echo "      $entry"
+            if [[ -n "$map_file" && -f "$map_file" ]]; then
+                echo "      → Points to: $map_file"
+            fi
+        elif [[ "$type" == "MAP" ]]; then
+            echo "  • Existing map file: $location"
+        fi
+    done
+    
+    echo ""
+    echo "This may conflict with the new configuration."
+    echo ""
+    echo "Options:"
+    echo "  1) Remove old configuration and continue (recommended)"
+    echo "  2) Keep old configuration and abort"
+    echo "  3) Continue anyway (may cause issues)"
+    echo ""
+    
+    if [[ ! -t 0 ]]; then
+        echo "ERROR: Cannot prompt for choice - stdin is not a terminal"
+        echo "Remove conflicts manually or run interactively."
+        exit 1
+    fi
+    
+    local choice
+    read -rp "Select option [1/2/3]: " choice
+    
+    case "$choice" in
+        1)
+            echo ""
+            echo "Removing old configuration..."
+            for conflict in "${conflicts[@]}"; do
+                IFS='|' read -r type location entry map_file <<< "$conflict"
+                
+                if [[ "$type" == "ENTRY" ]]; then
+                    echo "  Removing entry from $location..."
+                    # Create backup
+                    local backup
+                    backup="${location}.bak.$(date +%Y%m%d-%H%M%S)"
+                    cp "$location" "$backup"
+                    # Remove the /mnt/nas entry using unique temp file
+                    local temp_file="${location}.tmp.$$"
+                    TEMP_FILES_TO_CLEAN+=("$temp_file")
+                    if grep -v "^/mnt/nas[[:space:]]" "$location" > "$temp_file" 2>/dev/null; then
+                        mv "$temp_file" "$location"
+                        chmod 644 "$location"
+                    else
+                        rm -f "$temp_file"
+                        echo "    WARNING: Failed to update $location"
+                    fi
+                    
+                    # Also remove the old map file if it exists and isn't our target
+                    if [[ -n "$map_file" && -f "$map_file" && "$map_file" != "$AUTOFS_MAP" ]]; then
+                        local map_backup
+                        map_backup="${map_file}.bak.$(date +%Y%m%d-%H%M%S)"
+                        echo "  Backing up old map: $map_file → $map_backup"
+                        mv "$map_file" "$map_backup"
+                    fi
+                elif [[ "$type" == "MAP" ]]; then
+                    local map_backup
+                    map_backup="${location}.bak.$(date +%Y%m%d-%H%M%S)"
+                    echo "  Backing up old map: $location → $map_backup"
+                    mv "$location" "$map_backup"
+                fi
+            done
+            echo "Old configuration removed."
+            echo ""
+            ;;
+        2)
+            echo "Aborted. No changes made."
+            exit 1
+            ;;
+        3)
+            echo "Continuing. You may need to manually resolve conflicts later."
+            echo ""
+            ;;
+        *)
+            echo "Invalid choice. Aborting."
+            exit 1
+            ;;
+    esac
+}
+
+# Verify autofs is reading the correct map file after setup
+verify_autofs_setup() {
+    local expected_map="$1"
+    
+    echo "Verifying autofs configuration..."
+    
+    # Check if the map file exists and has correct permissions
+    if [[ ! -f "$expected_map" ]]; then
+        echo ""
+        echo "WARNING: Map file $expected_map does not exist!"
+        return 1
+    fi
+    
+    # Verify the map file contains expected content
+    if ! grep -q "fstype=cifs" "$expected_map" 2>/dev/null; then
+        echo ""
+        echo "WARNING: Map file $expected_map appears to be empty or malformed"
+        return 1
+    fi
+    
+    # Check that auto.master has our entry
+    if ! grep -q "^/mnt/nas[[:space:]].*$expected_map" "$PRIMARY_AUTO_MASTER" 2>/dev/null; then
+        echo ""
+        echo "WARNING: /mnt/nas entry not found in $PRIMARY_AUTO_MASTER"
+        return 1
+    fi
+    
+    # Verify autofs service is running
+    if ! systemctl is-active --quiet autofs; then
+        echo ""
+        echo "WARNING: autofs service is not running"
+        return 1
+    fi
+    
+    echo "✓ Autofs configuration verified"
+    return 0
 }
 
 # =============================================================================
@@ -522,6 +795,9 @@ esac
 # MAIN SETUP
 # =============================================================================
 
+# Track temp files globally so cleanup can remove them
+declare -a TEMP_FILES_TO_CLEAN=()
+
 # Cleanup function for trap
 cleanup() {
     local exit_code=$?
@@ -538,7 +814,13 @@ cleanup() {
     # errors if files were never created (e.g., script failed before that point).
     # The || true is belt-and-suspenders defensive coding.
     rm -f "${AUTOFS_MAP}.tmp" 2>/dev/null || true
+    # Clean up auto.master temp files from both possible locations
     rm -f "/etc/auto.master.tmp.$$" 2>/dev/null || true
+    rm -f "/etc/autofs/auto.master.tmp.$$" 2>/dev/null || true
+    # Clean up any registered temp files
+    for tmpfile in "${TEMP_FILES_TO_CLEAN[@]}"; do
+        rm -f "$tmpfile" 2>/dev/null || true
+    done
     exit "$exit_code"
 }
 trap cleanup EXIT
@@ -673,7 +955,27 @@ if ! command -v pacman &>/dev/null; then
     echo "For other distributions, manually install: autofs cifs-utils smbclient libnotify"
     exit 1
 fi
-pacman -S --needed --noconfirm autofs cifs-utils smbclient libnotify
+
+# Check if autofs is installed (it's in AUR, not official repos)
+if ! pacman -Qi autofs &>/dev/null; then
+    echo ""
+    echo "ERROR: autofs is not installed."
+    echo ""
+    echo "autofs is available from the AUR (Arch User Repository), not the official repos."
+    echo "Please install it using your preferred AUR helper, for example:"
+    echo ""
+    echo "  yay -S autofs"
+    echo "  # or"
+    echo "  paru -S autofs"
+    echo ""
+    echo "After installing autofs, re-run this script."
+    exit 1
+fi
+echo "✓ autofs is installed"
+
+# Install remaining packages from official repos
+echo "Installing dependencies from official repos..."
+pacman -S --needed --noconfirm cifs-utils smbclient libnotify
 
 # Create credentials file
 echo "Setting up credentials..."
@@ -705,15 +1007,23 @@ if [[ ! -f "$CREDS_FILE" ]]; then
         exit 1
     fi
     # Create file with restricted permissions before writing credentials
-    # to avoid brief window of world-readable sensitive data
-    install -m 600 /dev/null "$CREDS_FILE"
+    # to avoid brief window of world-readable sensitive data.
+    # Use mode 640 with user's group so the nas-share-monitor (running as user)
+    # can read it for smbclient authentication. This is a reasonable trade-off
+    # for a personal NAS setup - the user's group can read but others cannot.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        creds_group=$(id -gn "$SUDO_USER")
+    else
+        creds_group=$(id -gn)
+    fi
+    install -m 640 -o root -g "$creds_group" /dev/null "$CREDS_FILE"
     # Note: Using quoted heredoc delimiter to prevent expansion of special
     # characters in passwords (e.g., $, `, \). Variables are written via echo.
     {
         echo "username=$NAS_USER"
         echo "password=$SMB_PASS"
     } > "$CREDS_FILE"
-    echo "Credentials saved."
+    echo "Credentials saved (mode 640, group: $creds_group)."
 else
     echo "Credentials file already exists, validating..."
     # Validate credentials file has required fields
@@ -725,7 +1035,21 @@ else
         echo "Delete $CREDS_FILE and re-run this script"
         exit 1
     fi
-    echo "Credentials file valid."
+    # Check and fix permissions if needed (upgrade from older 600 mode)
+    current_mode=$(stat -c %a "$CREDS_FILE" 2>/dev/null || echo "unknown")
+    if [[ "$current_mode" == "600" ]]; then
+        echo "Updating credentials file permissions (600 → 640) for monitor access..."
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            creds_group=$(id -gn "$SUDO_USER")
+        else
+            creds_group=$(id -gn)
+        fi
+        chown "root:$creds_group" "$CREDS_FILE"
+        chmod 640 "$CREDS_FILE"
+        echo "Credentials file updated (mode 640, group: $creds_group)."
+    else
+        echo "Credentials file valid."
+    fi
 fi
 
 # Validate that configured shares actually exist on NAS before proceeding
@@ -758,6 +1082,17 @@ fi
 # in case of minimal install or manual package management)
 mkdir -p /etc/autofs
 
+# Check for conflicting NAS mount configurations before proceeding
+echo "Checking for existing NAS mount configurations..."
+mapfile -t conflict_list < <(check_for_conflicts)
+if [[ ${#conflict_list[@]} -gt 0 ]]; then
+    handle_conflicts "${conflict_list[@]}"
+fi
+
+# Detect which auto.master file is primary on this system
+PRIMARY_AUTO_MASTER=$(detect_primary_auto_master)
+echo "Detected primary auto.master: $PRIMARY_AUTO_MASTER"
+
 # Backup and modify auto.master
 # Note: Uses flock + temp file + atomic move to prevent race conditions.
 # This ensures that concurrent script runs or other processes modifying
@@ -766,32 +1101,36 @@ echo "Configuring auto.master..."
 (
     flock -x 200 || { echo "ERROR: Could not acquire lock on auto.master"; exit 1; }
     
-    if [[ -f /etc/auto.master ]]; then
+    if [[ -f "$PRIMARY_AUTO_MASTER" ]]; then
         # Create timestamped backup, keeping only the 5 most recent to prevent
         # indefinite accumulation from repeated script runs
-        backup_file="/etc/auto.master.bak.$(date +%Y%m%d-%H%M%S)"
-        echo "Backing up /etc/auto.master to $backup_file..."
-        cp /etc/auto.master "$backup_file"
+        backup_file="${PRIMARY_AUTO_MASTER}.bak.$(date +%Y%m%d-%H%M%S)"
+        echo "Backing up $PRIMARY_AUTO_MASTER to $backup_file..."
+        cp "$PRIMARY_AUTO_MASTER" "$backup_file"
         
         # Clean up old backups, keeping only the 5 most recent
         # Note: Uses find instead of ls to avoid parsing ls output, which is
         # fragile with special characters (though our timestamp format is safe)
-        find /etc -maxdepth 1 -name 'auto.master.bak.*' -printf '%T@ %p\n' 2>/dev/null | \
+        backup_dir=$(dirname "$PRIMARY_AUTO_MASTER")
+        # shellcheck disable=SC2295
+        # The pattern string for find's -name; not a glob expansion in bash context
+        backup_pattern="$(basename "$PRIMARY_AUTO_MASTER").bak.*"
+        find "$backup_dir" -maxdepth 1 -name "$backup_pattern" -printf '%T@ %p\n' 2>/dev/null | \
             sort -rn | tail -n +6 | cut -d' ' -f2- | xargs -r rm -f --
         
         # Create new auto.master without old /mnt/nas entry, then add our entry
-        grep -v "^/mnt/nas[[:space:]]" /etc/auto.master > "/etc/auto.master.tmp.$$" 2>/dev/null || true
+        grep -v "^/mnt/nas[[:space:]]" "$PRIMARY_AUTO_MASTER" > "${PRIMARY_AUTO_MASTER}.tmp.$$" 2>/dev/null || true
     else
         # No existing file; create empty temp file
-        : > "/etc/auto.master.tmp.$$"
+        : > "${PRIMARY_AUTO_MASTER}.tmp.$$"
     fi
     
     # Add our entry
-    echo "/mnt/nas $AUTOFS_MAP --timeout=300 --ghost" >> "/etc/auto.master.tmp.$$"
+    echo "/mnt/nas $AUTOFS_MAP --timeout=300 --ghost" >> "${PRIMARY_AUTO_MASTER}.tmp.$$"
     
     # Atomic move into place
-    mv "/etc/auto.master.tmp.$$" /etc/auto.master
-    chmod 644 /etc/auto.master
+    mv "${PRIMARY_AUTO_MASTER}.tmp.$$" "$PRIMARY_AUTO_MASTER"
+    chmod 644 "$PRIMARY_AUTO_MASTER"
 ) 200>/etc/auto.master.lock || exit 1
 
 # Clean up lock file (empty file left behind by flock)
@@ -1551,6 +1890,10 @@ add_shell_aliases
 echo "Starting autofs..."
 systemctl enable autofs
 systemctl restart autofs
+
+# Verify autofs is reading the correct configuration
+echo ""
+verify_autofs_setup "$AUTOFS_MAP" || echo "         (Setup continued despite verification warning)"
 
 echo ""
 echo "=== Setup Complete ==="
